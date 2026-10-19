@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram VPS monitor bot (read-only)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=vpsbot
+Group=vpsbot
+EnvironmentFile=/etc/vpsbot/env
+ExecStart=/usr/bin/python3 -I /opt/vpsbot/bot.py
+Restart=always
+RestartSec=15
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

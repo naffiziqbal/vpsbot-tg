@@ -11,14 +11,19 @@ One command to install, one token to paste. No dependencies beyond Python 3.8+.
 curl -fsSL https://raw.githubusercontent.com/naffiziqbal/vpsbot-tg/main/install.sh | sudo bash
 ```
 
+Run it as your admin user (any account with sudo, or root) — not as an app/deploy user. Install once:
+it's a system-wide service that watches every user's apps. If the sudo password prompt gets mixed up
+with the installer's prompts, run `sudo -v` first.
+
 The installer sets everything up, then walks you through:
 
 1. **Create a bot** — in Telegram message [@BotFather](https://t.me/BotFather), send `/newbot`, copy the token.
 2. **Paste the token** — the prompt is hidden; the token never appears on screen or in shell history.
-3. **Message your bot once** — the installer detects your chat ID and asks you to confirm it.
-   Only that account can use the bot.
+3. **Message your bot once** — send it a *new* message while the installer waits (older messages are
+   ignored on purpose). It detects your chat ID and asks you to confirm; only that account can use the bot.
 
-That's it — the bot says hello in Telegram. Send `/health`.
+That's it — the bot says hello in Telegram. Send `/health`. (The installer already records the
+integrity baseline; you don't need to run `baseline` after installing.)
 
 > Prefer to read before you run? `git clone https://github.com/naffiziqbal/vpsbot-tg && sudo ./vpsbot-tg/install.sh`
 > does the same from a local checkout.
@@ -28,7 +33,7 @@ That's it — the bot says hello in Telegram. Send `/health`.
 **Change token / chat:** `sudo vpsbot-setup`
 
 Requirements: Linux with systemd, `sudo`, Python ≥ 3.8 (installed automatically via apt/dnf if missing).
-Built for Debian/Ubuntu (Python 3.8+ compatible); tested on Ubuntu 24.04.
+Built for Debian/Ubuntu (Python 3.8+ compatible); fresh install, setup, update and uninstall tested on Ubuntu 24.04.
 
 ## Commands
 

@@ -4,6 +4,8 @@
 The bot runs as the unprivileged `vpsbot` user and may only run this file via sudo.
 Every command and argument is validated against a fixed allowlist; nothing here
 changes system state except its own baseline/cursor files in /var/lib/vpsbot-query.
+PM2 users, services, Docker, nginx sites and certs are auto-detected; optional
+settings live in /etc/vpsbot/config.
 
   vpsbot-query health|apps|docker|sites|certs|errors|top|disk|net|security|backup|logs-list
   vpsbot-query logs <name> [lines]
@@ -15,9 +17,12 @@ import datetime as dt
 import glob
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
+import pwd
 import re
+import shutil
 import socket
 import ssl
 import stat
@@ -25,19 +30,16 @@ import subprocess
 import sys
 import time
 
-PM2_USERS = ["apps", "thoughtexpense"]
-UNITS = ["nginx", "docker", "ssh", "cron", "fail2ban", "pm2-apps", "pm2-thoughtexpense",
-         "block-attacker-ips", "certbot.timer", "vpsbot"]
-ATTACKER_NETS = ["45.86.86.254", "195.178.110.0/24"]
+CONFIG_FILE = "/etc/vpsbot/config"
 STATE_DIR = "/var/lib/vpsbot-query"
 BASELINE = f"{STATE_DIR}/baseline.json"
 SSH_CURSOR = f"{STATE_DIR}/ssh.cursor"
-BACKUP_LOG = "/var/log/thoughtexpense-backup.log"
-BACKUP_DIR = "/var/backups/thought-expense"
+UNIT_CANDIDATES = ["nginx", "apache2", "httpd", "caddy", "docker", "ssh", "sshd", "ssh.socket", "cron", "crond", "fail2ban",
+                   "postgresql", "mysql", "mariadb", "redis-server", "redis", "mongod", "certbot.timer", "vpsbot"]
 WATCH_GLOBS = [
     "/etc/ld.so.preload", "/etc/ld.so.conf", "/etc/ld.so.conf.d/*",
     "/etc/crontab", "/etc/cron.d/*", "/etc/cron.hourly/*", "/etc/cron.daily/*",
-    "/etc/cron.weekly/*", "/etc/cron.monthly/*", "/var/spool/cron/crontabs/*",
+    "/etc/cron.weekly/*", "/etc/cron.monthly/*", "/var/spool/cron/crontabs/*", "/var/spool/cron/*",
     "/etc/systemd/system/*", "/etc/systemd/system/*/*", "/etc/systemd/user/*",
     "/etc/profile", "/etc/profile.d/*", "/etc/bash.bashrc", "/etc/environment",
     "/root/.bashrc", "/root/.profile", "/home/*/.bashrc", "/home/*/.profile",
@@ -58,12 +60,40 @@ ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 HTML = "#html\n"   # marker: output is Telegram HTML (every dynamic value escaped with e())
 
 
+def load_config():
+    cfg = {}
+    try:
+        for line in open(CONFIG_FILE):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip("\"'")
+    except OSError:
+        pass
+    return cfg
+
+
+CFG = load_config()
+BLOCKED_NETS = CFG.get("BLOCKED_NETS", "").split()
+EXTRA_UNITS = CFG.get("EXTRA_UNITS", "").split()
+BACKUP_NAME = CFG.get("BACKUP_NAME") or "Backup"
+BACKUP_LOG = CFG.get("BACKUP_LOG", "")
+BACKUP_GLOB = CFG.get("BACKUP_GLOB", "")
+CERT_DAYS = int(CFG.get("CERT_DAYS") or 14)
+
+
+def has(tool):
+    return shutil.which(tool) is not None
+
+
 def sh(cmd, timeout=20):
+    if not has(cmd[0]):
+        return ""
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.stdout
-    except Exception as e:
-        return f"[{cmd[0]} failed: {e}]"
+    except Exception as ex:
+        return f"[{cmd[0]} failed: {ex}]"
 
 
 def redact(text):
@@ -73,20 +103,14 @@ def redact(text):
     return text
 
 
-def human(n):
-    for unit in ["B", "K", "M", "G", "T"]:
-        if abs(n) < 1024:
-            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
-        n /= 1024
-    return f"{n:.1f}P"
-
-
 def e(v):
     return str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def mb(n):
-    return f"{n / 1024**3:.1f} GB" if n >= 1024**3 else f"{n / 1024**2:.0f} MB"
+    if n >= 1024**3:
+        return f"{n / 1024**3:.1f} GB"
+    return f"{n / 1024**2:.0f} MB" if n >= 1024**2 else f"{n / 1024:.0f} KB"
 
 
 def meter(label, pct, extra=""):
@@ -121,9 +145,8 @@ def meminfo():
         k, v = line.split(":")
         m[k] = int(v.split()[0]) * 1024
     used = m["MemTotal"] - m["MemAvailable"]
-    swap_used = m["SwapTotal"] - m["SwapFree"]
     return {"total": m["MemTotal"], "used": used, "pct": round(100 * used / m["MemTotal"], 1),
-            "swap_total": m["SwapTotal"], "swap_used": swap_used}
+            "swap_total": m["SwapTotal"], "swap_used": m["SwapTotal"] - m["SwapFree"]}
 
 
 def disk(path="/"):
@@ -136,22 +159,43 @@ def uptime_s():
     return float(open("/proc/uptime").read().split()[0])
 
 
+def pm2_users():
+    """Users whose PM2 daemon is running (never starts a daemon for anyone)."""
+    if CFG.get("PM2_USERS"):
+        names = CFG["PM2_USERS"].split()
+        return [p for p in pwd.getpwall() if p.pw_name in names]
+    users = []
+    for p in pwd.getpwall():
+        try:
+            pid = int(open(os.path.join(p.pw_dir, ".pm2", "pm2.pid")).read().strip())
+            alive = open(f"/proc/{pid}/cmdline", "rb").read().startswith(b"PM2") and os.stat(f"/proc/{pid}").st_uid == p.pw_uid
+        except (OSError, ValueError):
+            continue
+        if alive and p.pw_name not in [u.pw_name for u in users]:
+            users.append(p)
+    return users
+
+
 def pm2_apps():
     out = {}
-    for u in PM2_USERS:
-        raw = sh(["runuser", "-u", u, "--", "env", f"HOME=/home/{u}", f"PM2_HOME=/home/{u}/.pm2",
-                  "/usr/bin/pm2", "jlist"], timeout=30)
+    pm2 = shutil.which("pm2")
+    if not pm2:
+        return out
+    for u in pm2_users():
+        raw = sh(["setpriv", f"--reuid={u.pw_uid}", f"--regid={u.pw_gid}", "--init-groups", "env",
+                  f"HOME={u.pw_dir}", f"PM2_HOME={u.pw_dir}/.pm2", pm2, "jlist"], timeout=30)
         try:
             procs = json.loads(raw[raw.index("["):])
         except ValueError:
-            out[f"{u}/?"] = {"status": "pm2 unreachable", "restarts": 0, "uptime": 0, "mem": 0, "cpu": 0}
+            out[f"{u.pw_name}/?"] = {"status": "pm2 unreachable", "restarts": 0, "uptime": 0, "mem": 0, "cpu": 0}
             continue
         for p in procs:
-            e = p.get("pm2_env", {})
-            up = (time.time() - e.get("pm_uptime", 0) / 1000) if e.get("status") == "online" else 0
-            out[f"{u}/{p['name']}"] = {"status": e.get("status"), "restarts": e.get("restart_time", 0),
-                                       "uptime": up, "mem": p.get("monit", {}).get("memory", 0),
-                                       "cpu": p.get("monit", {}).get("cpu", 0)}
+            env = p.get("pm2_env", {})
+            up = (time.time() - env.get("pm_uptime", 0) / 1000) if env.get("status") == "online" else 0
+            out[f"{u.pw_name}/{p['name']}"] = {"status": env.get("status"), "restarts": env.get("restart_time", 0),
+                                               "uptime": up, "mem": p.get("monit", {}).get("memory", 0),
+                                               "cpu": p.get("monit", {}).get("cpu", 0),
+                                               "err_log": env.get("pm_err_log_path"), "out_log": env.get("pm_out_log_path")}
     return out
 
 
@@ -167,14 +211,26 @@ def containers():
 
 
 def units():
-    return {u: sh(["systemctl", "is-active", u]).strip() or "unknown" for u in UNITS}
+    enabled = set()
+    for line in sh(["systemctl", "list-unit-files", "--state=enabled", "--no-legend", "--type=service,timer,socket"]).splitlines():
+        if line.split():
+            enabled.add(line.split()[0])
+    names = [u for u in UNIT_CANDIDATES if (u if "." in u else u + ".service") in enabled]
+    names += sorted(u[:-len(".service")] for u in enabled if re.fullmatch(r"pm2-[\w.-]+\.service", u))
+    names += [u for u in EXTRA_UNITS if u not in names]
+    for dup in ("sshd", "ssh.socket"):              # one entry for SSH is enough
+        if dup in names and any(s in names for s in ("ssh", "sshd") if s != dup):
+            names.remove(dup)
+    return {u: sh(["systemctl", "is-active", u]).strip() or "unknown" for u in names}
 
 
 def blocked_out_packets():
+    if not BLOCKED_NETS:
+        return 0
     total = 0
     for line in sh(["iptables", "-L", "OUTPUT", "-v", "-n", "-x"]).splitlines():
         parts = line.split()
-        if len(parts) >= 9 and parts[2] == "DROP" and parts[-1] in ATTACKER_NETS:
+        if len(parts) >= 9 and parts[2] == "DROP" and parts[-1] in BLOCKED_NETS:
             total += int(parts[0])
     return total
 
@@ -185,8 +241,7 @@ def listening():
         parts = line.split()
         if len(parts) < 5:
             continue
-        addr = parts[4]
-        port = addr.rsplit(":", 1)[-1]
+        port = parts[4].rsplit(":", 1)[-1]
         m = re.search(r'\(\("([^"]+)"', line)
         ports.add(f"{parts[0]}:{port}:{m.group(1) if m else '?'}")
     return ports
@@ -243,8 +298,7 @@ def integrity():
     changes = [f"added {p}" for p in sorted(now.keys() - old.keys())]
     changes += [f"removed {p}" for p in sorted(old.keys() - now.keys())]
     changes += [f"changed {p}" for p in sorted(p for p in now.keys() & old.keys() if now[p] != old[p])]
-    new_ports = sorted(listening() - set(base["ports"]))
-    return {"files": changes, "ports": new_ports}
+    return {"files": changes, "ports": sorted(listening() - set(base["ports"]))}
 
 
 def preload():
@@ -260,9 +314,8 @@ def ssh_new_logins():
     cur = open(SSH_CURSOR).read().strip() if os.path.exists(SSH_CURSOR) else None
     cmd = ["journalctl", "-u", "ssh", "-u", "sshd", "-o", "short-iso", "--show-cursor", "--no-pager"]
     cmd += ["--after-cursor", cur] if cur else ["-n", "0"]
-    out = sh(cmd)
     logins, new_cur = [], None
-    for line in out.splitlines():
+    for line in sh(cmd).splitlines():
         if line.startswith("-- cursor:"):
             new_cur = line.split(":", 1)[1].strip()
         elif "Accepted " in line:
@@ -278,19 +331,23 @@ def ssh_new_logins():
 
 def cert_list():
     out = []
+    now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
     for p in sorted(glob.glob("/etc/letsencrypt/live/*/cert.pem")):
-        end = sh(["openssl", "x509", "-enddate", "-noout", "-in", p]).strip().split("=", 1)[-1]
+        name = os.path.basename(os.path.dirname(p))
         try:
-            exp = dt.datetime.strptime(end, "%b %d %H:%M:%S %Y %Z")
-            out.append((os.path.basename(os.path.dirname(p)), (exp - dt.datetime.now(dt.UTC).replace(tzinfo=None)).days))
+            end = ssl._ssl._test_decode_cert(p)["notAfter"]
+        except Exception:
+            end = sh(["openssl", "x509", "-enddate", "-noout", "-in", p]).strip().split("=", 1)[-1]
+        try:
+            out.append((name, (dt.datetime.strptime(end, "%b %d %H:%M:%S %Y %Z") - now).days))
         except ValueError:
-            out.append((os.path.basename(os.path.dirname(p)), -999))
+            out.append((name, -999))
     return out
 
 
 def site_hosts():
     hosts = set()
-    for f in glob.glob("/etc/nginx/sites-enabled/*"):
+    for f in glob.glob("/etc/nginx/sites-enabled/*") + glob.glob("/etc/nginx/conf.d/*.conf"):
         try:
             text = open(f).read()
         except OSError:
@@ -305,7 +362,12 @@ def site_hosts():
 
 
 def my_ips():
-    return set(sh(["hostname", "-I"]).split())
+    ips = set(sh(["hostname", "-I"]).split())
+    for line in sh(["ip", "-o", "addr"]).splitlines():
+        m = re.search(r"inet6? ([0-9a-fA-F:.]+)/", line)
+        if m:
+            ips.add(m.group(1))
+    return ips
 
 
 def probe(host, mine):
@@ -313,7 +375,7 @@ def probe(host, mine):
         ips = {a[4][0] for a in socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)}
     except socket.gaierror:
         return host, {"status": "no-dns", "days": None, "elsewhere": True}
-    if not ips & mine:
+    if not ips & mine and not CFG.get("SITES_BEHIND_PROXY"):
         return host, {"status": "dns-elsewhere", "days": None, "elsewhere": True}
     try:
         conn = http.client.HTTPSConnection(host, 443, timeout=10, context=ssl.create_default_context())
@@ -323,10 +385,10 @@ def probe(host, mine):
         status = conn.getresponse().status
         conn.close()
         return host, {"status": status, "days": int((exp - time.time()) / 86400), "elsewhere": False}
-    except ssl.SSLError as e:
-        return host, {"status": f"TLS: {e.reason}", "days": None, "elsewhere": False}
-    except Exception as e:
-        return host, {"status": f"ERR: {type(e).__name__}", "days": None, "elsewhere": False}
+    except ssl.SSLError as ex:
+        return host, {"status": f"TLS: {ex.reason}", "days": None, "elsewhere": False}
+    except Exception as ex:
+        return host, {"status": f"ERR: {type(ex).__name__}", "days": None, "elsewhere": False}
 
 
 def sites():
@@ -336,18 +398,21 @@ def sites():
 
 
 def site_ok(s):
-    return isinstance(s, int) and (s < 500)
+    return isinstance(s, int) and s < 500
 
 
 def log_sources():
     src = {}
-    for u in PM2_USERS:
-        for p in glob.glob(f"/home/{u}/.pm2/logs/*-out.log"):
-            name = os.path.basename(p)[:-len("-out.log")]
-            src[name] = [("stderr", p[:-len("-out.log")] + "-error.log"), ("stdout", p)]
-    src["nginx"] = [("nginx error", "/var/log/nginx/error.log")]
-    src["access"] = [("nginx access", "/var/log/nginx/access.log")]
-    src["backup"] = [("backup", BACKUP_LOG)]
+    for key, a in pm2_apps().items():
+        user, name = key.split("/", 1)
+        if a.get("out_log") or a.get("err_log"):
+            src[name if name not in src else f"{user}.{name}"] = [("stderr", a.get("err_log") or ""),
+                                                                   ("stdout", a.get("out_log") or "")]
+    if os.path.isdir("/var/log/nginx"):
+        src["nginx"] = [("nginx error", "/var/log/nginx/error.log")]
+        src["access"] = [("nginx access", "/var/log/nginx/access.log")]
+    if BACKUP_LOG:
+        src["backup"] = [("backup", BACKUP_LOG)]
     for c in containers():
         src[f"docker:{c}"] = [("docker", f"docker:{c}")]
     src["ssh"] = [("ssh", "journal:ssh")]
@@ -366,11 +431,14 @@ def tail(path, n):
     try:
         with open(path, "rb") as f:
             f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - 400 * n))
+            f.seek(max(0, f.tell() - 400 * n))
             return f.read().decode("utf-8", "replace").splitlines()[-n:]
     except OSError:
         return ["(no log file)"]
+
+
+def backup_files():
+    return sorted(glob.glob(BACKUP_GLOB), key=os.path.getmtime) if BACKUP_GLOB else []
 
 
 # ---------- text commands ----------
@@ -382,7 +450,7 @@ def cmd_health():
     bad_apps = [k for k, v in apps.items() if v["status"] != "online"]
     bad_cons = [k for k, v in cons.items() if v["state"] != "running"]
     bad_units = [k for k, v in us.items() if v != "active"]
-    integ, blocked, pre = integrity(), blocked_out_packets(), preload()
+    integ, blocked, pre, tmpx = integrity(), blocked_out_packets(), preload(), tmp_exec_files()
 
     issues = []
     if bad_units: issues.append(f"Services down: {', '.join(bad_units)}")
@@ -390,12 +458,14 @@ def cmd_health():
     if bad_cons: issues.append(f"Containers stopped: {', '.join(bad_cons)}")
     issues += [f"File {x}" for x in integ["files"][:5]]
     issues += [f"New port {x}" for x in integ["ports"]]
-    if blocked: issues.append(f"{blocked} packets to miner C2 blocked")
+    if blocked: issues.append(f"{blocked} packets to blocked IPs")
     if pre: issues.append(f"ld.so.preload: {pre}")
+    if tmpx: issues.append(f"{len(tmpx)} executable/hidden file(s) in tmp dirs")
     for label, v in (("CPU", c), ("RAM", m["pct"]), ("Disk", d["pct"])):
         if v >= 85: issues.append(f"{label} at {v:.0f}%")
 
     ok = lambda bad: "🔴" if bad else "🟢"
+    threats = blocked or pre or tmpx
     lines = [
         f"🖥 <b>{e(socket.gethostname())}</b>  ·  {'✅ All good' if not issues else f'⚠️ {len(issues)} issue(s)'}",
         f"⏱ up {dur(up)}  ·  load {l1:.2f} {l5:.2f} {l15:.2f}  ·  {os.cpu_count()} CPU",
@@ -407,26 +477,36 @@ def cmd_health():
         "",
         "<b>Status</b>",
         f"{ok(bad_units)} Services  ·  {len(us) - len(bad_units)}/{len(us)} active",
-        f"{ok(bad_apps)} Apps  ·  {len(apps) - len(bad_apps)}/{len(apps)} online",
-        f"{ok(bad_cons)} Docker  ·  {len(cons) - len(bad_cons)}/{len(cons)} running",
+    ]
+    if apps:
+        lines.append(f"{ok(bad_apps)} Apps  ·  {len(apps) - len(bad_apps)}/{len(apps)} online")
+    if cons:
+        lines.append(f"{ok(bad_cons)} Docker  ·  {len(cons) - len(bad_cons)}/{len(cons)} running")
+    lines += [
         f"{ok(integ['files'] or integ['ports'])} Integrity  ·  "
         + ("unchanged" if not (integ["files"] or integ["ports"]) else f"{len(integ['files'])} file(s), {len(integ['ports'])} port(s) changed"),
-        f"{ok(blocked or pre)} Malware  ·  {'clean' if not (blocked or pre) else 'CHECK NOW'}",
+        f"{ok(threats)} Threats  ·  {'none found' if not threats else 'CHECK NOW'}",
     ]
     if issues:
         lines += ["", "<b>⚠️ Issues</b>"] + [f"• {e(i)}" for i in issues]
-    lines += ["", "<i>/apps  /docker  /sites  /security</i>"]
+    more = ["/apps"] if apps else []
+    more += ["/docker"] if cons else []
+    lines += ["", "<i>" + "  ".join(more + ["/sites", "/security"]) + "</i>"]
     return HTML + "\n".join(lines)
 
 
 def cmd_apps():
     apps = pm2_apps()
+    if not apps:
+        return HTML + "📦 <b>PM2 apps</b>\n\nNo running PM2 daemons found."
     online = sum(v["status"] == "online" for v in apps.values())
     lines = [f"📦 <b>PM2 apps</b>  ·  {online}/{len(apps)} online"]
-    for u in PM2_USERS:
-        mine = {k.split("/", 1)[1]: v for k, v in apps.items() if k.startswith(u + "/")}
+    for u in dict.fromkeys(k.split("/", 1)[0] for k in apps):
         lines += ["", f"👤 <b>{e(u)}</b>"]
-        for name, v in mine.items():
+        for key, v in apps.items():
+            if not key.startswith(u + "/"):
+                continue
+            name = key.split("/", 1)[1]
             if v["status"] == "online":
                 detail = f"up {dur(v['uptime'])} · {mb(v['mem'])} · cpu {v['cpu']}%"
                 detail += f" · ⚠️ {v['restarts']} restarts" if v["restarts"] else ""
@@ -437,6 +517,8 @@ def cmd_apps():
 
 
 def cmd_docker():
+    if not has("docker"):
+        return HTML + "🐳 <b>Docker</b>\n\nDocker is not installed."
     cons = containers()
     stats = {}
     for line in sh(["docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"], timeout=30).splitlines():
@@ -453,12 +535,15 @@ def cmd_docker():
 
 def cmd_sites():
     res = sites()
+    if not res:
+        return HTML + "🌐 <b>Sites</b>\n\nNo nginx HTTPS sites found (sites-enabled / conf.d)."
     here = {h: s for h, s in res.items() if not s["elsewhere"]}
     down = {h: s for h, s in here.items() if not site_ok(s["status"])}
     lines = [f"🌐 <b>Sites</b>  ·  {len(here) - len(down)}/{len(here)} up"]
     if down:
         lines += ["", "<b>🔴 Down</b>"] + [f"🔴 {e(h)}  <code>{e(s['status'])}</code>" for h, s in down.items()]
-    lines += ["", "<b>Up</b>  <i>(status · cert days)</i>"]
+    if len(here) > len(down):
+        lines += ["", "<b>Up</b>  <i>(status · cert days)</i>"]
     for h, s in here.items():
         if h not in down:
             days = f" · {s['days']}d" if s["days"] is not None else ""
@@ -471,8 +556,10 @@ def cmd_sites():
 
 def cmd_certs():
     certs = sorted(cert_list(), key=lambda x: x[1])
-    groups = [("🔴 Expiring (&lt;14 days)", lambda d: d < 14), ("🟡 Soon (&lt;30 days)", lambda d: 14 <= d < 30),
-              ("🟢 OK", lambda d: d >= 30)]
+    if not certs:
+        return HTML + "🔐 <b>Certificates</b>\n\nNo Let's Encrypt certificates found."
+    groups = [(f"🔴 Expiring (&lt;{CERT_DAYS} days)", lambda d: d < CERT_DAYS),
+              ("🟡 Soon (&lt;30 days)", lambda d: CERT_DAYS <= d < 30), ("🟢 OK", lambda d: d >= 30)]
     lines = [f"🔐 <b>Certificates</b>  ·  {len(certs)} total"]
     for title, pick in groups:
         sel = [(n, d) for n, d in certs if pick(d)]
@@ -512,9 +599,12 @@ def cmd_errors():
                 continue
             out.append(f"── {name} (stderr, changed {dur(time.time() - os.path.getmtime(path))} ago) ──")
             out += tail(path, 8)
-    out.append("── nginx error.log ──")
-    out += tail("/var/log/nginx/error.log", 8)
-    return redact("\n".join(out)) if out else "No app errors in the last 24h."
+    if os.path.exists("/var/log/nginx/error.log"):
+        out.append("── nginx error.log ──")
+        out += tail("/var/log/nginx/error.log", 8)
+    out.append("── system errors (journal) ──")
+    out += tail("journal:prio", 8)
+    return redact("\n".join(out))
 
 
 def cmd_top():
@@ -524,23 +614,28 @@ def cmd_top():
 
 
 def cmd_disk():
-    out = sh(["df", "-h", "-x", "tmpfs", "-x", "overlay", "-x", "squashfs", "-x", "efivarfs"]).strip()
-    out += "\n\nDocker\n" + sh(["docker", "system", "df"]).strip()
-    out += "\n\nLogs\n" + sh(["du", "-sh", "/var/log", "/home/apps/.pm2/logs", "/home/thoughtexpense/.pm2/logs", "/root/.pm2/logs"], timeout=30).strip()
+    out = sh(["df", "-h", "-x", "tmpfs", "-x", "devtmpfs", "-x", "overlay", "-x", "squashfs", "-x", "efivarfs"]).strip()
+    if has("docker"):
+        out += "\n\nDocker\n" + sh(["docker", "system", "df"]).strip()
+    log_dirs = ["/var/log"] + [f"{u.pw_dir}/.pm2/logs" for u in pm2_users() if os.path.isdir(f"{u.pw_dir}/.pm2/logs")]
+    out += "\n\nLogs\n" + sh(["du", "-sh", *log_dirs], timeout=30).strip()
     return out
 
 
 def cmd_net():
-    lines = ["Listening ports"]
-    lines += sorted(listening())
-    est = sh(["ss", "-tnH", "state", "established"]).splitlines()
+    lines = ["Listening ports"] + sorted(listening())
     remote = {}
-    for line in est:
+    for line in sh(["ss", "-tnH", "state", "established"]).splitlines():
         parts = line.split()
         if len(parts) >= 4:
             ip = parts[3].rsplit(":", 1)[0].strip("[]")
-            if not ip.startswith(("127.", "172.", "::1", "10.")):
-                remote[ip] = remote.get(ip, 0) + 1
+            try:
+                a = ipaddress.ip_address(ip.split("%")[0])
+                if a.is_private or a.is_loopback:
+                    continue
+            except ValueError:
+                continue
+            remote[ip] = remote.get(ip, 0) + 1
     lines.append(f"\nEstablished external connections: {sum(remote.values())}")
     lines += [f"  {c:>3}  {ip}" for ip, c in sorted(remote.items(), key=lambda x: -x[1])[:10]]
     return "\n".join(lines)
@@ -561,10 +656,10 @@ def cmd_security():
             if "COMMAND=" in l and "vpsbot-query" not in l]
     tmpx, pre, blocked = tmp_exec_files(), preload(), blocked_out_packets()
     flag = lambda bad: "🔴" if bad else "🟢"
-    lines = [
-        "🛡 <b>Security</b>", "",
-        "<b>Malware indicators</b>",
-        f"{flag(blocked)} C2 outbound packets  ·  {blocked}",
+    lines = ["🛡 <b>Security</b>", "", "<b>Threat indicators</b>"]
+    if BLOCKED_NETS:
+        lines.append(f"{flag(blocked)} Packets to blocked IPs  ·  {blocked}")
+    lines += [
         f"{flag(pre)} ld.so.preload  ·  {e(pre) if pre else 'empty'}",
         f"{flag(tmpx)} Exec files in tmp  ·  {len(tmpx)}",
         *[f"   ⚠️ <code>{e(p)}</code>" for p in tmpx[:10]],
@@ -573,7 +668,8 @@ def cmd_security():
         f"{flag(integ['ports'])} New ports  ·  {len(integ['ports'])}",
         *[f"   ⚠️ <code>{e(p)}</code>" for p in integ["ports"]],
         "",
-        f"<b>SSH (24h)</b>  ·  {len(accepted)} logins · {failed} failures · {banned.group(1) if banned else '?'} banned",
+        f"<b>SSH (24h)</b>  ·  {len(accepted)} logins · {failed} failures"
+        + (f" · {banned.group(1)} banned" if banned else ""),
         *[f"<code>{e(a[:90])}</code>" for a in accepted[-6:]],
         "",
         f"<b>sudo (24h)</b>  ·  {len(sudo)} commands",
@@ -586,17 +682,22 @@ def cmd_security():
 
 
 def cmd_backup():
-    log_lines = [l for l in tail(BACKUP_LOG, 12) if l.strip()]
-    ok = any("done" in l for l in log_lines[-2:])
-    dumps = sorted(glob.glob(f"{BACKUP_DIR}/*.dump"), key=os.path.getmtime)
-    lines = [f"💾 <b>ThoughtExpense backup</b>  ·  {'✅ last run OK' if ok else '⚠️ check log'}", ""]
-    if dumps:
-        p = dumps[-1]
-        lines += [f"Newest dump: <code>{e(os.path.basename(p))}</code>",
-                  f"└ {mb(os.path.getsize(p))} · {dur(time.time() - os.path.getmtime(p))} ago · {len(dumps)} kept locally"]
-    else:
-        lines.append("⚠️ No local dumps found")
-    lines += ["", "<b>Last log lines</b>"] + [f"<code>{e(l[:90])}</code>" for l in log_lines[-6:]]
+    if not (BACKUP_LOG or BACKUP_GLOB):
+        return HTML + ("💾 <b>Backup</b>\n\nNot configured. Set <code>BACKUP_LOG</code> and/or "
+                       "<code>BACKUP_GLOB</code> in <code>/etc/vpsbot/config</code>.")
+    files = backup_files()
+    fresh = bool(files) and time.time() - os.path.getmtime(files[-1]) < 26 * 3600
+    status = ("✅ newest file &lt; 26h old" if fresh else "⚠️ no backup in the last 26h") if BACKUP_GLOB else ""
+    lines = [f"💾 <b>{e(BACKUP_NAME)}</b>" + (f"  ·  {status}" if status else ""), ""]
+    if files:
+        p = files[-1]
+        lines += [f"Newest: <code>{e(os.path.basename(p))}</code>",
+                  f"└ {mb(os.path.getsize(p))} · {dur(time.time() - os.path.getmtime(p))} ago · {len(files)} kept locally"]
+    elif BACKUP_GLOB:
+        lines.append("⚠️ No backup files match BACKUP_GLOB")
+    if BACKUP_LOG:
+        log_lines = [l for l in tail(BACKUP_LOG, 12) if l.strip()]
+        lines += ["", "<b>Last log lines</b>"] + [f"<code>{e(l[:90])}</code>" for l in log_lines[-6:]]
     return HTML + redact("\n".join(lines))
 
 
@@ -604,6 +705,7 @@ def cmd_backup():
 
 def cmd_check():
     integ = integrity()
+    files = backup_files()
     return json.dumps({
         "cpu": cpu_pct(), "mem": meminfo()["pct"], "disk": disk()["pct"], "load1": os.getloadavg()[0],
         "uptime": uptime_s(), "apps": pm2_apps(),
@@ -611,7 +713,8 @@ def cmd_check():
         "units": units(), "integrity": integ["files"], "new_ports": integ["ports"],
         "blocked_out": blocked_out_packets(), "preload": preload(), "tmp_exec": tmp_exec_files(),
         "ssh_logins": ssh_new_logins(),
-        "certs_low": [f"{n} ({d}d)" for n, d in cert_list() if d < 14],
+        "certs_low": [f"{n} ({d}d)" for n, d in cert_list() if d < CERT_DAYS],
+        "backup_age_h": round((time.time() - os.path.getmtime(files[-1])) / 3600, 1) if files else None,
     })
 
 

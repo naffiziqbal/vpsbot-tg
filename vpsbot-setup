@@ -1,0 +1,119 @@
+#!/usr/bin/python3 -I
+"""Configure vpsbot: paste the bot token (hidden), message the bot once so your chat ID
+is detected, then the service is (re)started.
+
+  sudo vpsbot-setup
+  sudo VPSBOT_CHAT_ID=-100123 vpsbot-setup     # skip detection (e.g. a group chat)
+"""
+import getpass
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+ENV = "/etc/vpsbot/env"
+
+# same as the bot: IPv4 to Telegram is the reliable path on many VPS networks
+_getaddrinfo = socket.getaddrinfo
+socket.getaddrinfo = lambda *a, **k: [r for r in _getaddrinfo(*a, **k) if r[0] == socket.AF_INET] or _getaddrinfo(*a, **k)
+
+
+def api(token, method, **params):
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}", data=json.dumps(params).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=40) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as ex:
+        try:
+            return json.load(ex)
+        except ValueError:
+            return {"ok": False, "description": f"HTTP {ex.code}"}
+    except Exception as ex:
+        return {"ok": False, "description": str(ex)}
+
+
+def systemctl(*args):
+    return subprocess.run(["systemctl", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+
+
+def detect_chat(token, username):
+    last = api(token, "getUpdates", offset=-1, timeout=0).get("result") or []
+    offset = last[-1]["update_id"] + 1 if last else None     # ignore anything sent before now
+    print(f"\n2) Open  https://t.me/{username}  in Telegram and send it any message (tap Start).")
+    print("   Waiting for your message (up to 3 minutes)...")
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        res = api(token, "getUpdates", offset=offset, timeout=25, allowed_updates=["message"])
+        if not res.get("ok"):
+            sys.exit(f"Telegram error while waiting: {res.get('description')}")
+        for u in res["result"]:
+            offset = u["update_id"] + 1
+            m = u.get("message") or {}
+            if m.get("chat", {}).get("type") == "private":
+                api(token, "getUpdates", offset=offset, timeout=0)   # acknowledge
+                return m
+    sys.exit("No message received. Run `sudo vpsbot-setup` again.")
+
+
+def main():
+    if os.geteuid() != 0:
+        sys.exit("run with sudo")
+    print("vpsbot setup\n\n1) In Telegram, message @BotFather, send /newbot, and copy the token it gives you.")
+    token = getpass.getpass("   Paste the bot token (input hidden): ").strip()
+    if not re.fullmatch(r"\d{6,12}:[A-Za-z0-9_-]{30,}", token):
+        sys.exit("That doesn't look like a bot token (expected 123456789:ABC...).")
+    me = api(token, "getMe")
+    if not me.get("ok"):
+        sys.exit(f"Telegram rejected the token: {me.get('description')}")
+    username = me["result"]["username"]
+    print(f"   ✓ token OK: @{username}")
+
+    systemctl("stop", "vpsbot")            # its long-poll would steal our getUpdates
+    hook = (api(token, "getWebhookInfo").get("result") or {}).get("url")
+    if hook:
+        if input(f"   This bot has a webhook ({hook}); polling needs it removed. Remove? [y/N] ").strip().lower() != "y":
+            sys.exit("Aborted.")
+        api(token, "deleteWebhook")
+
+    chat = os.environ.get("VPSBOT_CHAT_ID", "").strip()
+    if not chat:
+        m = detect_chat(token, username)
+        f = m.get("from", {})
+        who = " ".join(x for x in (f.get("first_name"), f.get("last_name")) if x) or "unknown"
+        who += f" (@{f['username']})" if f.get("username") else ""
+        print(f"   Message received from: {who}, chat id {m['chat']['id']}")
+        if input("   Only this account will be able to use the bot. Continue? [Y/n] ").strip().lower() in ("n", "no"):
+            sys.exit("Aborted. Run again and message the bot from the right account.")
+        chat = str(m["chat"]["id"])
+    if not re.fullmatch(r"-?\d+", chat):
+        sys.exit("VPSBOT_CHAT_ID must be a number")
+
+    os.makedirs("/etc/vpsbot", exist_ok=True)
+    old = os.umask(0o027)
+    with open(ENV, "w") as fh:
+        fh.write(f"VPSBOT_TOKEN={token}\nVPSBOT_CHAT_ID={chat}\n")
+    os.umask(old)
+    subprocess.run(["chown", "root:vpsbot", ENV], check=True)
+    os.chmod(ENV, 0o640)
+    print(f"   ✓ saved {ENV}")
+
+    systemctl("enable", "vpsbot")
+    systemctl("restart", "vpsbot")
+    time.sleep(4)
+    if systemctl("is-active", "--quiet", "vpsbot") != 0:
+        subprocess.run(["journalctl", "-u", "vpsbot", "-n", "15", "--no-pager"])
+        sys.exit("vpsbot failed to start (log above).")
+    print(f"\n✅ vpsbot is running. Check Telegram — @{username} just said hello. Try /health")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        sys.exit("\nAborted.")

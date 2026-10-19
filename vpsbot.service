@@ -7,6 +7,7 @@ Wants=network-online.target
 User=vpsbot
 Group=vpsbot
 EnvironmentFile=/etc/vpsbot/env
+EnvironmentFile=-/etc/vpsbot/config
 ExecStart=/usr/bin/python3 -I /opt/vpsbot/bot.py
 Restart=always
 RestartSec=15

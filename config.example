@@ -1,0 +1,33 @@
+# vpsbot settings — all optional, everything else is auto-detected.
+# Edit /etc/vpsbot/config, then: sudo systemctl restart vpsbot
+
+# Alert thresholds (percent)
+#CPU_ALERT=90
+#MEM_ALERT=90
+#DISK_ALERT=85
+
+# Alert when a Let's Encrypt certificate has fewer days left than this
+#CERT_DAYS=14
+
+# Hour of the daily /health report (0-23, server time)
+#DAILY_HOUR=9
+
+# Extra systemd units to monitor, space separated (nginx, docker, ssh, cron, fail2ban,
+# databases, certbot.timer and pm2-* units are picked up automatically when enabled)
+#EXTRA_UNITS="myapp worker"
+
+# Only these PM2 users (default: every user with a running PM2 daemon)
+#PM2_USERS="deploy"
+
+# IPs / CIDRs you block with an iptables OUTPUT DROP rule; alerts if anything tries to reach them
+#BLOCKED_NETS="203.0.113.7 198.51.100.0/24"
+
+# Backup monitoring: a log to show and/or a glob of backup files.
+# Alerts when the newest matching file is older than BACKUP_MAX_AGE_H hours.
+#BACKUP_NAME="Postgres backup"
+#BACKUP_LOG=/var/log/backup.log
+#BACKUP_GLOB=/var/backups/db/*.dump
+#BACKUP_MAX_AGE_H=26
+
+# Check sites even when their DNS doesn't point at this server (e.g. behind a CDN proxy)
+#SITES_BEHIND_PROXY=1

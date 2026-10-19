@@ -21,7 +21,12 @@ from datetime import datetime
 
 TOKEN = os.environ["VPSBOT_TOKEN"]
 CHAT_ID = int(os.environ["VPSBOT_CHAT_ID"])
-DAILY_HOUR = int(os.environ.get("VPSBOT_DAILY_HOUR", "9"))
+DAILY_HOUR = int(os.environ.get("DAILY_HOUR") or os.environ.get("VPSBOT_DAILY_HOUR") or 9)
+CPU_ALERT = float(os.environ.get("CPU_ALERT") or 90)
+MEM_ALERT = float(os.environ.get("MEM_ALERT") or 90)
+DISK_ALERT = float(os.environ.get("DISK_ALERT") or 85)
+BACKUP_MAX_AGE_H = float(os.environ.get("BACKUP_MAX_AGE_H") or 26)
+HAS_BACKUP = bool(os.environ.get("BACKUP_LOG") or os.environ.get("BACKUP_GLOB"))
 HELPER = "/usr/local/sbin/vpsbot-query"
 API = f"https://api.telegram.org/bot{TOKEN}/"
 CHECK_EVERY = 60
@@ -34,7 +39,7 @@ _getaddrinfo = socket.getaddrinfo
 socket.getaddrinfo = lambda *a, **k: [r for r in _getaddrinfo(*a, **k) if r[0] == socket.AF_INET] or _getaddrinfo(*a, **k)
 
 COMMANDS = [
-    ("health", "Overall health: CPU, RAM, disk, services, apps, malware checks"),
+    ("health", "Overall health: CPU, RAM, disk, services, apps, threat checks"),
     ("apps", "PM2 apps: status, uptime, restarts, memory"),
     ("docker", "Docker containers and their usage"),
     ("sites", "HTTPS status of every site + cert days"),
@@ -44,11 +49,13 @@ COMMANDS = [
     ("top", "Top processes by CPU and memory"),
     ("disk", "Disk, Docker and log usage"),
     ("net", "Listening ports and external connections"),
-    ("security", "SSH logins, sudo, integrity, malware indicators"),
-    ("backup", "Last ThoughtExpense DB backup"),
+    ("security", "SSH logins, sudo, integrity, threat indicators"),
+    ("backup", "Latest backup status"),
     ("alerts", "Currently active alerts"),
     ("help", "This list"),
 ]
+if not HAS_BACKUP:
+    COMMANDS = [c for c in COMMANDS if c[0] != "backup"]
 
 
 def log(*a):
@@ -150,11 +157,14 @@ class Monitor:
             return
         p = self.prev
 
-        self.cpu_high = self.cpu_high + 1 if d["cpu"] >= 90 else 0
+        self.cpu_high = self.cpu_high + 1 if d["cpu"] >= CPU_ALERT else 0
         self.state("cpu", self.cpu_high >= 5, f"🔥 CPU at {d['cpu']}% for 5+ min (load {d['load1']:.1f}). /top",
                    f"✅ CPU back to normal ({d['cpu']}%)")
-        self.state("mem", d["mem"] >= 90, f"🔥 RAM at {d['mem']}%. /top", f"✅ RAM back to {d['mem']}%")
-        self.state("disk", d["disk"] >= 85, f"💾 Disk at {d['disk']}%. /disk", f"✅ Disk at {d['disk']}%")
+        self.state("mem", d["mem"] >= MEM_ALERT, f"🔥 RAM at {d['mem']}%. /top", f"✅ RAM back to {d['mem']}%")
+        self.state("disk", d["disk"] >= DISK_ALERT, f"💾 Disk at {d['disk']}%. /disk", f"✅ Disk at {d['disk']}%")
+        if HAS_BACKUP and d.get("backup_age_h") is not None:
+            self.state("backup", d["backup_age_h"] > BACKUP_MAX_AGE_H,
+                       f"💾 No new backup for {d['backup_age_h']:.0f}h. /backup", "✅ Fresh backup found")
 
         for u, s in d["units"].items():
             self.state(f"unit:{u}", s != "active", f"🔴 Service {u} is {s}", f"✅ Service {u} is active again")
@@ -184,8 +194,8 @@ class Monitor:
         self.state("tmpexec", bool(d["tmp_exec"]), "🚨 Executable/hidden files in tmp dirs:\n" + "\n".join(d["tmp_exec"][:15]),
                    "✅ tmp dirs clean again")
         if p and d["blocked_out"] > p["blocked_out"]:
-            send(f"🚨 Something on the server tried to reach the miner C2 IPs "
-                 f"({d['blocked_out'] - p['blocked_out']} packets blocked). Check /top and /net now.", pre=False)
+            send(f"🚨 Something on the server tried to reach a blocked IP from BLOCKED_NETS "
+                 f"({d['blocked_out'] - p['blocked_out']} packets dropped). Check /top and /net now.", pre=False)
         for login in d["ssh_logins"]:
             send(f"🔑 SSH login: {login}", pre=False)
         for c in d["certs_low"]:
@@ -237,7 +247,7 @@ def handle(text, monitor):
         send("#html\n🤖 <b>VPS bot</b>  ·  read-only\n\n"
              + "\n".join(f"/{c}  —  {html.escape(d)}" for c, d in COMMANDS)
              + "\n\n<b>🔔 Pushed automatically</b>\nservices · apps · containers · sites · CPU/RAM/disk · "
-             "file integrity · SSH logins · certs · malware C2\n\n<i>Daily report at "
+             "file integrity · SSH logins · certs · threat indicators\n\n<i>Daily report at "
              f"{DAILY_HOUR:02d}:00</i>")
         return
     if cmd == "alerts":

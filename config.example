@@ -9,8 +9,44 @@
 # Alert when a Let's Encrypt certificate has fewer days left than this
 #CERT_DAYS=14
 
-# Hour of the daily /health report (0-23, server time)
+# Hour of the daily /health report (0-23, server time); weekly summary on WEEKLY_DAY (0 = Monday)
 #DAILY_HOUR=9
+#WEEKLY_DAY=0
+
+# Dead-man's switch: pinged every minute while the bot and its checks are healthy.
+# Create a free check at https://healthchecks.io (period 1 min, grace 5 min) and paste its ping URL;
+# it alerts you (email/Telegram) when the pings stop - i.e. when the server or the bot is down.
+#HEARTBEAT_URL=https://hc-ping.com/your-uuid
+
+# Disk-full forecast: alert when the 72h trend fills the disk within this many days
+#DISK_FULL_DAYS=7
+
+# Sites: alert when 3 checks in a row are slower than this (ms)
+#SITE_SLOW_MS=2000
+# Content check, "host=text; host2=other text": alert when the page no longer contains the text
+#SITE_EXPECT="example.com=Welcome; shop.example.com=Add to cart"
+
+# Domains: alert this many days before registration expiry (found from nginx/certs, plus DOMAINS)
+#DOMAIN_DAYS=30
+#DOMAINS="example.org"
+
+# Apps: memory leak = steady climb of at least LEAK_MB over hours; crash loop = CRASH_LOOP restarts/hour
+#LEAK_MB=150
+#CRASH_LOOP=3
+
+# nginx traffic (5 min windows): 5xx spike, traffic spike vs the 24h median, one IP flooding
+#TRAFFIC_5XX_MIN=20
+#TRAFFIC_5XX_PCT=10
+#TRAFFIC_SPIKE_X=10
+#TRAFFIC_MIN_RPM=100
+#IP_FLOOD_RPM=200
+
+# Outbound: alert on sustained upload >= NET_TX_MB per minute and NET_SPIKE_X x the 24h median,
+# and on outgoing connections to public IPs on ports other than these defaults
+# (22 25 53 80 443 465 587 853 993 995 5222 8443) + OUT_PORTS_OK
+#NET_TX_MB=50
+#NET_SPIKE_X=10
+#OUT_PORTS_OK="9418 6697"
 
 # Extra systemd units to monitor, space separated (nginx, docker, ssh, cron, fail2ban,
 # databases, certbot.timer and pm2-* units are picked up automatically when enabled)

@@ -12,6 +12,9 @@ ExecStart=/usr/bin/python3 -I /opt/vpsbot/bot.py
 Restart=always
 RestartSec=15
 ProtectSystem=full
+# metrics history for /graph, forecasts and /week: /var/lib/vpsbot/history.db
+StateDirectory=vpsbot
+StateDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target

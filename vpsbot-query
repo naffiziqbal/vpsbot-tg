@@ -7,9 +7,9 @@ changes system state except its own baseline/cursor files in /var/lib/vpsbot-que
 PM2 users, services, Docker, nginx sites and certs are auto-detected; optional
 settings live in /etc/vpsbot/config.
 
-  vpsbot-query health|apps|docker|sites|certs|errors|top|disk|net|security|backup|logs-list
+  vpsbot-query health|apps|docker|sites|certs|errors|top|disk|net|security|backup|traffic|db|domains|logs-list
   vpsbot-query logs <name> [lines]
-  vpsbot-query check | check-sites          (JSON, used by the alert loop)
+  vpsbot-query check | check-sites | check-db | check-domains   (JSON, used by the alert loop)
   sudo vpsbot-query baseline                (admin only: accept current files/ports as known-good)
 """
 import concurrent.futures as cf
@@ -29,11 +29,13 @@ import stat
 import subprocess
 import sys
 import time
+import urllib.request
 
 CONFIG_FILE = "/etc/vpsbot/config"
 STATE_DIR = "/var/lib/vpsbot-query"
 BASELINE = f"{STATE_DIR}/baseline.json"
 SSH_CURSOR = f"{STATE_DIR}/ssh.cursor"
+DOMAIN_CACHE = f"{STATE_DIR}/domains.json"
 UNIT_CANDIDATES = ["nginx", "apache2", "httpd", "caddy", "docker", "ssh", "sshd", "ssh.socket", "cron", "crond", "fail2ban",
                    "postgresql", "mysql", "mariadb", "redis-server", "redis", "mongod", "certbot.timer", "vpsbot"]
 WATCH_GLOBS = [
@@ -80,6 +82,13 @@ BACKUP_NAME = CFG.get("BACKUP_NAME") or "Backup"
 BACKUP_LOG = CFG.get("BACKUP_LOG", "")
 BACKUP_GLOB = CFG.get("BACKUP_GLOB", "")
 CERT_DAYS = int(CFG.get("CERT_DAYS") or 14)
+EXTRA_DOMAINS = CFG.get("DOMAINS", "").split()
+# "host=text; host2=other text": alert when the page no longer contains the text (defacement / broken deploy)
+SITE_EXPECT = dict(x.strip().split("=", 1) for x in CFG.get("SITE_EXPECT", "").split(";") if "=" in x)
+# outbound TCP to public IPs on other ports is reported (+ OUT_PORTS_OK from the config)
+OUT_PORTS_OK = {"22", "25", "53", "80", "443", "465", "587", "853", "993", "995", "5222", "8443"} | set(
+    CFG.get("OUT_PORTS_OK", "").split())
+MINER_PORTS = {"3333", "3357", "4444", "5555", "5730", "6666", "7777", "14433", "14444", "45560", "45700"}
 
 
 def has(tool):
@@ -263,6 +272,60 @@ def listening():
     return ports
 
 
+def net_bytes():
+    """rx, tx bytes of physical interfaces (no lo / docker bridges / veth)."""
+    rx = tx = 0
+    for line in open("/proc/net/dev").readlines()[2:]:
+        name, data = line.split(":", 1)
+        if re.match(r"\s*(lo|docker\d*|br-|veth|virbr|tun|wg|tailscale|cni|flannel)", name):
+            continue
+        v = data.split()
+        rx, tx = rx + int(v[0]), tx + int(v[8])
+    return rx, tx
+
+
+def proc_user(pid):
+    try:
+        return pwd.getpwuid(os.stat(f"/proc/{pid}").st_uid).pw_name
+    except (OSError, KeyError):
+        return "?"
+
+
+def outbound_odd():
+    """Outgoing TCP connections to public IPs on unusual ports (C2, miners, exfil)."""
+    listen = {l.split()[3].rsplit(":", 1)[-1] for l in sh(["ss", "-ltnH"]).splitlines() if len(l.split()) > 3}
+    found = set()
+    for line in sh(["ss", "-tnpH", "state", "established"]).splitlines():
+        parts = line.split()
+        if len(parts) < 4 or parts[2].rsplit(":", 1)[-1] in listen:
+            continue
+        ip, port = parts[3].rsplit(":", 1)
+        try:
+            a = ipaddress.ip_address(ip.strip("[]").split("%")[0])
+            a = getattr(a, "ipv4_mapped", None) or a
+        except ValueError:
+            continue
+        if not a.is_global or port in OUT_PORTS_OK:
+            continue
+        m = re.search(r'\(\("([^"]+)",pid=(\d+)', line)
+        who = f"{proc_user(m.group(2))}/{m.group(1)}" if m else "?"
+        found.add(f"{who} → {a}:{port}" + (" ⛏ mining-pool port" if port in MINER_PORTS else ""))
+    return sorted(found)
+
+
+def odd_processes():
+    """Processes whose binary was deleted or lives in a tmp dir."""
+    found = set()
+    for d in glob.glob("/proc/[0-9]*"):
+        try:
+            exe = os.readlink(f"{d}/exe")
+        except OSError:
+            continue
+        if exe.endswith(" (deleted)") or exe.startswith(("/tmp/", "/var/tmp/", "/dev/shm/")):
+            found.add(f"{proc_user(d[6:])}: {exe}")
+    return sorted(found)
+
+
 def watched_files():
     files = {}
     for g in WATCH_GLOBS:
@@ -397,10 +460,15 @@ def probe(host, mine):
         conn = http.client.HTTPSConnection(host, 443, timeout=10, context=ssl.create_default_context())
         conn.connect()
         exp = ssl.cert_time_to_seconds(conn.sock.getpeercert()["notAfter"])
+        t0 = time.monotonic()
         conn.request("GET", "/", headers={"User-Agent": "vpsbot-healthcheck"})
-        status = conn.getresponse().status
+        resp = conn.getresponse()
+        body = resp.read(512 * 1024) if host in SITE_EXPECT else b""
+        ms = int((time.monotonic() - t0) * 1000)
         conn.close()
-        return host, {"status": status, "days": int((exp - time.time()) / 86400), "elsewhere": False}
+        content = SITE_EXPECT[host].encode() in body if host in SITE_EXPECT else None
+        return host, {"status": resp.status, "days": int((exp - time.time()) / 86400), "elsewhere": False,
+                      "ms": ms, "content_ok": content}
     except ssl.SSLError as ex:
         return host, {"status": f"TLS: {ex.reason}", "days": None, "elsewhere": False}
     except Exception as ex:
@@ -455,6 +523,262 @@ def tail(path, n):
 
 def backup_files():
     return sorted(glob.glob(BACKUP_GLOB), key=os.path.getmtime) if BACKUP_GLOB else []
+
+
+# ---------- nginx traffic ----------
+
+ACCESS_RX = re.compile(r'^(\S+) \S+ \S+ \[([^\]]+)\] "(?:(\S+) (\S+)[^"]*|[^"]*)" (\d{3}) \S+ "[^"]*" "([^"]*)"')
+SCANNER_RX = re.compile(r"(?i)(wp-login|wp-admin|wp-content|wp-includes|xmlrpc|/\.env|/\.git|phpmyadmin|/cgi-bin|"
+                        r"\.php\b|/actuator|/boaform|/HNAP1|/vendor/|/\.aws|/\.ssh|/server-status|/owa/|/solr|"
+                        r"/console|/\.well-known/security|/autodiscover|\.\./|%2e%2e)")
+BOT_RX = re.compile(r"(?i)(bot|crawl|spider|slurp|curl|wget|python|go-http|scrapy|headless|libwww|zgrab|masscan|nmap)")
+
+
+def access_logs():
+    return [p for p in glob.glob("/var/log/nginx/*access.log") if os.path.isfile(p)]
+
+
+def read_since(path, cutoff):
+    """Lines of a log newer than cutoff (epoch), read backwards; falls back into the rotated .1 file."""
+    def tail_back(p):
+        try:
+            with open(p, "rb") as f:
+                end = f.seek(0, 2)
+                pos, buf = end, b""
+                while pos > 0 and end - pos < 64 * 1024 * 1024:
+                    step = min(256 * 1024, pos)
+                    pos -= step
+                    f.seek(pos)
+                    buf = f.read(step) + buf
+                    first = buf.split(b"\n", 2)[1 if pos else 0] if buf.count(b"\n") > 1 else b""
+                    t = line_time(first.decode("utf-8", "replace"))
+                    if t is not None and t < cutoff:
+                        break
+        except OSError:
+            return [], False
+        lines = buf.decode("utf-8", "replace").splitlines()[1 if pos else 0:]
+        return lines, pos > 0 or (bool(lines) and (line_time(lines[0]) or 0) < cutoff)
+    lines, complete = tail_back(path)
+    if not complete:
+        older, _ = tail_back(path + ".1")
+        lines = older + lines
+    return lines
+
+
+def line_time(line):
+    m = re.search(r"\[(\d\d/\w{3}/\d{4}:\d\d:\d\d:\d\d [+-]\d{4})\]", line)
+    if not m:
+        return None
+    try:
+        return dt.datetime.strptime(m.group(1), "%d/%b/%Y:%H:%M:%S %z").timestamp()
+    except ValueError:
+        return None
+
+
+def traffic(minutes):
+    cutoff = time.time() - minutes * 60
+    reqs = []
+    for p in access_logs():
+        for line in read_since(p, cutoff):
+            m = ACCESS_RX.match(line)
+            if not m:
+                continue
+            t = line_time(line)
+            if t is None or t < cutoff:
+                continue
+            reqs.append({"ip": m.group(1), "path": (m.group(4) or "-").split("?")[0], "status": int(m.group(5)),
+                         "ua": m.group(6)})
+    return reqs
+
+
+def top(items, n):
+    c = {}
+    for i in items:
+        c[i] = c.get(i, 0) + 1
+    return sorted(c.items(), key=lambda x: -x[1])[:n]
+
+
+def traffic_summary(minutes=5):
+    reqs = traffic(minutes)
+    ip = top([r["ip"] for r in reqs], 1)
+    return {"req": len(reqs), "err5": sum(r["status"] >= 500 for r in reqs),
+            "top_ip": ip[0][0] if ip else None, "top_ip_n": ip[0][1] if ip else 0}
+
+
+# ---------- databases ----------
+
+def docker_env(name):
+    raw = sh(["docker", "inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", name])
+    env = {}
+    for line in raw.splitlines():
+        k, _, v = line.partition("=")
+        if k in ("POSTGRES_USER", "POSTGRES_DB"):        # never anything else (passwords stay where they are)
+            env[k] = v
+    return env
+
+
+PG_SQL = ("select (select count(*) from pg_stat_activity), current_setting('max_connections'), "
+          "(select count(*) from pg_stat_activity where state <> 'idle' and pid <> pg_backend_pid() "
+          "and now() - query_start > interval '30 seconds'), "
+          "(select coalesce(sum(pg_database_size(datname)), 0) from pg_database "
+          "where datallowconn and has_database_privilege(datname, 'CONNECT'))")
+MONGO_JS = ("try { const s = db.serverStatus(); print(JSON.stringify({c: s.connections.current, "
+            "m: s.connections.current + s.connections.available, "
+            "size: Number(db.adminCommand({listDatabases: 1}).totalSize)})) } "
+            "catch (x) { print(JSON.stringify({ping: db.adminCommand({ping: 1}).ok})) }")
+
+
+def parse_pg(out):
+    try:
+        c, m, slow, size = out.strip().splitlines()[-1].split("|")
+        return {"ok": True, "conns": int(c), "max": int(m), "slow": int(slow), "size": int(size)}
+    except ValueError:
+        return {"ok": False, "err": (out.strip().splitlines() or ["no answer"])[-1][:120]}
+
+
+def parse_redis(out):
+    if "NOAUTH" in out:
+        return {"ok": True, "note": "password protected - reachability only"}
+    info = dict(l.split(":", 1) for l in out.splitlines() if ":" in l and not l.startswith("#"))
+    if "connected_clients" not in info:
+        return {"ok": False, "err": (out.strip().splitlines() or ["no answer"])[-1][:120]}
+    return {"ok": True, "conns": int(info["connected_clients"]), "max": int(info.get("maxclients", 0)) or None,
+            "size": int(info.get("used_memory", 0)), "maxmem": int(info.get("maxmemory", 0)) or None,
+            "rejected": int(info.get("rejected_connections", 0))}
+
+
+def parse_mongo(out):
+    try:
+        d = json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"ok": False, "err": (out.strip().splitlines() or ["no answer"])[-1][:120]}
+    if "ping" in d:
+        return {"ok": d["ping"] == 1, "note": "auth required - reachability only"}
+    return {"ok": True, "conns": d["c"], "max": d["m"], "size": int(d.get("size") or 0)}
+
+
+def db_probe(name, kind, cmd):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        out = r.stdout + r.stderr
+    except Exception as ex:
+        return name, {"kind": kind, "ok": False, "err": type(ex).__name__}
+    res = {"postgres": parse_pg, "redis": parse_redis, "mongo": parse_mongo}[kind](out)
+    res["kind"] = kind
+    return name, res
+
+
+def db_targets():
+    t = []
+    for name, c in containers().items():
+        if c["state"] != "running":
+            continue
+        img = c["image"].split("/")[-1]
+        if img.startswith(("postgres", "timescale", "postgis")):
+            env = docker_env(name)
+            user = env.get("POSTGRES_USER") or "postgres"
+            t.append((name, "postgres", ["docker", "exec", name, "psql", "-U", user, "-d", env.get("POSTGRES_DB") or user,
+                                         "-Atc", PG_SQL]))
+        elif img.startswith(("redis", "valkey", "keydb")):
+            t.append((name, "redis", ["docker", "exec", name, "redis-cli", "INFO"]))
+        elif img.startswith("mongo"):
+            t.append((name, "mongo", ["docker", "exec", name, "sh", "-c",
+                                      'exec $(command -v mongosh || echo mongo) --quiet --eval "$0"', MONGO_JS]))
+    us = units()
+    if us.get("postgresql") == "active" and has("psql"):
+        t.append(("postgresql", "postgres", ["setpriv", "--reuid=postgres", "--regid=postgres", "--init-groups",
+                                             "psql", "-h", "/var/run/postgresql", "-Atc", PG_SQL]))
+    for u in ("redis-server", "redis"):
+        if us.get(u) == "active" and has("redis-cli"):
+            t.append((u, "redis", ["redis-cli", "INFO"]))
+    return t
+
+
+def dbs():
+    with cf.ThreadPoolExecutor(8) as ex:
+        return dict(ex.map(lambda x: db_probe(*x), db_targets()))
+
+
+# ---------- domain expiry ----------
+
+def registrable(host):
+    labels = host.lower().rstrip(".").split(".")
+    if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in ("com", "co", "net", "org", "gov", "edu", "ac", "or", "ne"):
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def domain_names():
+    hosts = set(site_hosts()) | {n for n, _ in cert_list() if "." in n}
+    return sorted({registrable(h) for h in hosts} | set(EXTRA_DOMAINS))
+
+
+EXPIRY_RX = re.compile(r"(?im)^\s*(?:registry expiry date|registrar registration expiration date|expiration date|"
+                       r"expiry date|expires on|expire date|paid-till|expires)\s*:\s*(\S+)")
+
+
+def utcnow():
+    return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+
+def rdap_expiry(domain):
+    req = urllib.request.Request(f"https://rdap.org/domain/{domain}", headers={"Accept": "application/rdap+json", "User-Agent": "vpsbot-domain-check/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            events = json.load(r).get("events", [])
+    except Exception:
+        return None
+    for ev in events:
+        if ev.get("eventAction") == "expiration":
+            when = dt.datetime.strptime(ev["eventDate"][:19], "%Y-%m-%dT%H:%M:%S")
+            return {"days": (when - utcnow()).days, "expires": when.strftime("%Y-%m-%d")}
+    return None
+
+
+def whois_expiry(domain):
+    r = rdap_expiry(domain)
+    if r:
+        return r
+    out = sh(["whois", domain], timeout=25)
+    if not out:
+        return {"days": None, "err": "whois not installed" if not has("whois") else "no answer"}
+    if "no whois server" in out.lower():
+        return {"days": None, "err": "registry has no public whois"}
+    m = EXPIRY_RX.search(out)
+    if not m:
+        return {"days": None, "err": "no expiry date in whois"}
+    raw = m.group(1)
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d", "%Y.%m.%d", "%d-%b-%Y", "%Y/%m/%d"):
+        try:
+            when = dt.datetime.strptime(raw, fmt).replace(tzinfo=None)
+            return {"days": (when - utcnow()).days, "expires": when.strftime("%Y-%m-%d")}
+        except ValueError:
+            continue
+    return {"days": None, "err": f"unparsed date {raw[:30]}"}
+
+
+def domains(max_age_h=12):
+    """Domain -> expiry; whois answers are cached so registries don't rate-limit us."""
+    try:
+        cache = json.load(open(DOMAIN_CACHE))
+    except (OSError, ValueError):
+        cache = {}
+    names = domain_names()
+    stale = [d for d in names if time.time() - cache.get(d, {}).get("ts", 0) > max_age_h * 3600]
+    with cf.ThreadPoolExecutor(4) as ex:
+        for d, r in zip(stale, ex.map(whois_expiry, stale)):
+            r["ts"] = time.time()
+            cache[d] = r
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    with open(DOMAIN_CACHE, "w") as f:
+        json.dump(cache, f)
+    out = {}
+    for d in names:
+        r = dict(cache[d])
+        if r.get("expires"):          # recompute days from the cached date
+            r["days"] = (dt.datetime.strptime(r["expires"], "%Y-%m-%d") - utcnow()).days
+        out[d] = r
+    return out
 
 
 # ---------- text commands ----------
@@ -559,11 +883,13 @@ def cmd_sites():
     if down:
         lines += ["", "<b>🔴 Down</b>"] + [f"🔴 {e(h)}  <code>{e(s['status'])}</code>" for h, s in down.items()]
     if len(here) > len(down):
-        lines += ["", "<b>Up</b>  <i>(status · cert days)</i>"]
+        lines += ["", "<b>Up</b>  <i>(status · response time · cert days)</i>"]
     for h, s in here.items():
         if h not in down:
             days = f" · {s['days']}d" if s["days"] is not None else ""
-            lines.append(f"🟢 {e(h)}  <code>{s['status']}{days}</code>")
+            slow = "🐢 " if s.get("ms", 0) >= 2000 else ""
+            bad = " ⚠️ content" if s.get("content_ok") is False else ""
+            lines.append(f"🟢 {e(h)}  <code>{s['status']} · {slow}{s.get('ms', '?')}ms{days}</code>{bad}")
     other = [h for h, s in res.items() if s["elsewhere"]]
     if other:
         lines += ["", "<b>⚪ DNS not pointing here</b>"] + [f"⚪ {e(h)}" for h in other]
@@ -717,12 +1043,96 @@ def cmd_backup():
     return HTML + redact("\n".join(lines))
 
 
+def cmd_traffic(minutes="60"):
+    if not access_logs():
+        return HTML + "🚦 <b>Traffic</b>\n\nNo nginx access logs found in /var/log/nginx."
+    if not re.fullmatch(r"\d{1,4}", minutes):
+        return "Usage: /traffic [minutes]"
+    minutes = max(1, min(int(minutes), 1440))
+    reqs = traffic(minutes)
+    n = len(reqs)
+    if not n:
+        return HTML + f"🚦 <b>Traffic</b>  ·  last {minutes} min\n\nNo requests."
+    by = lambda lo, hi: sum(lo <= r["status"] < hi for r in reqs)
+    scans = [r for r in reqs if SCANNER_RX.search(r["path"])]
+    bots = sum(bool(BOT_RX.search(r["ua"])) for r in reqs)
+    pct = lambda x: f"{100 * x / n:.0f}%"
+    lines = [f"🚦 <b>Traffic</b>  ·  last {minutes} min",
+             f"{n} requests · {n / minutes:.1f}/min · {len({r['ip'] for r in reqs})} IPs", "",
+             "<b>Status</b>",
+             f"<code>2xx {by(200, 300):>6}  3xx {by(300, 400):>6}</code>",
+             f"<code>4xx {by(400, 500):>6}  5xx {by(500, 600):>6}</code>"
+             + ("  🔴" if by(500, 600) and by(500, 600) >= 0.05 * n else ""),
+             "", f"<b>Bots / scanners</b>  ·  {pct(bots)} bot user-agents · {len(scans)} probe requests"]
+    lines += [f"<code>{c:>5}  {e(ip)}</code>" for ip, c in top([r["ip"] for r in scans], 3)]
+    lines += ["", "<b>Top IPs</b>"] + [f"<code>{c:>5}  {e(ip)}</code>" for ip, c in top([r["ip"] for r in reqs], 6)]
+    lines += ["", "<b>Top paths</b>"] + [f"<code>{c:>5}  {e(p[:60])}</code>" for p, c in top([r["path"] for r in reqs], 6)]
+    nf = [r["path"] for r in reqs if r["status"] == 404]
+    if nf:
+        lines += ["", "<b>Top 404s</b>"] + [f"<code>{c:>5}  {e(p[:60])}</code>" for p, c in top(nf, 6)]
+    err = [f"{r['status']} {r['path']}" for r in reqs if r["status"] >= 500]
+    if err:
+        lines += ["", "<b>5xx</b>"] + [f"<code>{c:>5}  {e(p[:60])}</code>" for p, c in top(err, 6)]
+    return HTML + redact("\n".join(lines))
+
+
+def cmd_db():
+    res = dbs()
+    if not res:
+        return HTML + "🗄 <b>Databases</b>\n\nNo PostgreSQL / Redis / MongoDB found (host services or Docker)."
+    icon = {"postgres": "🐘", "redis": "🟥", "mongo": "🍃"}
+    up = sum(r["ok"] for r in res.values())
+    lines = [f"🗄 <b>Databases</b>  ·  {up}/{len(res)} reachable"]
+    for name, r in sorted(res.items()):
+        lines += ["", f"{'🟢' if r['ok'] else '🔴'} {icon[r['kind']]} <b>{e(name)}</b>"]
+        if not r["ok"]:
+            lines.append(f"└ {e(r.get('err', 'unreachable'))}")
+            continue
+        if "conns" not in r:
+            lines.append(f"└ {e(r.get('note', 'ok'))}")
+            continue
+        conn = f"{r['conns']}/{r['max']}" if r.get("max") else str(r["conns"])
+        detail = [f"{conn} connections"]
+        if r["kind"] == "redis":
+            detail.append(f"mem {mb(r['size'])}" + (f" / {mb(r['maxmem'])}" if r.get("maxmem") else ""))
+            if r.get("rejected"):
+                detail.append(f"⚠️ {r['rejected']} rejected")
+        else:
+            detail.append(f"size {mb(r['size'])}")
+        if r.get("slow"):
+            detail.append(f"🐢 {r['slow']} queries &gt;30s")
+        lines.append("└ " + " · ".join(detail))
+    return HTML + "\n".join(lines)
+
+
+def cmd_domains():
+    res = domains()
+    if not res:
+        return HTML + "🌍 <b>Domains</b>\n\nNo domains found (nginx server_name / certificates / DOMAINS in config)."
+    known = sorted(((d, r) for d, r in res.items() if r.get("days") is not None), key=lambda x: x[1]["days"])
+    lines = [f"🌍 <b>Domain registrations</b>  ·  {len(res)} domains", ""]
+    for d, r in known:
+        days = r["days"]
+        dot = "🔴" if days < 30 else "🟡" if days < 60 else "🟢"
+        state = "EXPIRED" if days < 0 else f"{days}d"
+        lines.append(f"{dot} <code>{state:>7}</code>  {e(d)}  <i>{e(r['expires'])}</i>")
+    unknown = [(d, r) for d, r in res.items() if r.get("days") is None]
+    if unknown:
+        lines += ["", "<b>⚪ Unknown</b>"] + [f"⚪ {e(d)}  <i>{e(r.get('err', ''))}</i>" for d, r in unknown]
+    return HTML + "\n".join(lines)
+
+
 # ---------- JSON for the alert loop ----------
 
 def cmd_check():
     integ = integrity()
     files = backup_files()
+    rx, tx = net_bytes()
+    d = disk()
     return json.dumps({
+        "disk_used": d["used"], "disk_total": d["total"], "rx": rx, "tx": tx,
+        "traffic": traffic_summary(5) if access_logs() else None,
+        "out_odd": outbound_odd(), "odd_procs": odd_processes(),
         "cpu": cpu_pct(), "mem": meminfo()["pct"], "disk": disk()["pct"], "load1": os.getloadavg()[0],
         "uptime": uptime_s(), "apps": pm2_apps(),
         "docker": {k: v["state"] for k, v in containers().items()},
@@ -736,6 +1146,14 @@ def cmd_check():
 
 def cmd_check_sites():
     return json.dumps({h: s for h, s in sites().items() if not s["elsewhere"]})
+
+
+def cmd_check_db():
+    return json.dumps(dbs())
+
+
+def cmd_check_domains():
+    return json.dumps(domains())
 
 
 def cmd_baseline():
@@ -752,7 +1170,8 @@ def cmd_baseline():
 COMMANDS = {
     "health": cmd_health, "apps": cmd_apps, "docker": cmd_docker, "sites": cmd_sites, "certs": cmd_certs,
     "logs": cmd_logs, "errors": cmd_errors, "top": cmd_top, "disk": cmd_disk, "net": cmd_net,
-    "security": cmd_security, "backup": cmd_backup, "check": cmd_check, "check-sites": cmd_check_sites,
+    "security": cmd_security, "backup": cmd_backup, "traffic": cmd_traffic, "db": cmd_db, "domains": cmd_domains,
+    "check": cmd_check, "check-sites": cmd_check_sites, "check-db": cmd_check_db, "check-domains": cmd_check_domains,
     "baseline": cmd_baseline, "logs-list": lambda: " ".join(sorted(log_sources())),
 }
 
@@ -764,6 +1183,6 @@ if __name__ == "__main__":
         sys.exit(__doc__)
     if len(args) > 3 or any(not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", a) for a in args):
         sys.exit("bad arguments")
-    if args[0] != "logs" and len(args) > 1:
+    if args[0] not in ("logs", "traffic") and len(args) > 1 or args[0] == "traffic" and len(args) > 2:
         sys.exit("this command takes no arguments")
     print(COMMANDS[args[0]](*args[1:]))

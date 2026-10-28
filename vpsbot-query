@@ -235,15 +235,31 @@ def blocked_out_packets():
     return total
 
 
+# NTP clients open a throwaway UDP socket on a random ephemeral port for each sync
+EPHEMERAL_UDP_CLIENTS = {"systemd-timesyn", "chronyd"}
+
+
+def ephemeral_range():
+    try:
+        lo, hi = open("/proc/sys/net/ipv4/ip_local_port_range").read().split()
+        return int(lo), int(hi)
+    except (OSError, ValueError):
+        return 32768, 60999
+
+
 def listening():
     ports = set()
+    lo, hi = ephemeral_range()
     for line in sh(["ss", "-ltnupH"]).splitlines():
         parts = line.split()
         if len(parts) < 5:
             continue
         port = parts[4].rsplit(":", 1)[-1]
         m = re.search(r'\(\("([^"]+)"', line)
-        ports.add(f"{parts[0]}:{port}:{m.group(1) if m else '?'}")
+        proc = m.group(1) if m else "?"
+        if parts[0] == "udp" and proc in EPHEMERAL_UDP_CLIENTS and port.isdigit() and lo <= int(port) <= hi:
+            continue
+        ports.add(f"{parts[0]}:{port}:{proc}")
     return ports
 
 
